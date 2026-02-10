@@ -93,9 +93,24 @@ def merge_players(
       - headshot_percentage / adr / rws / rating_plus：按 turns 加权平均
     """
     groups: Dict[str, List[Dict[str, Any]]] = {}
+    match_log: Dict[str, set] = {}  # canonical -> {ocr_name, ...}
     for record in all_records:
-        matched = fuzzy_match(record["player_name"], roster)
+        ocr_name = record["player_name"]
+        matched = fuzzy_match(ocr_name, roster)
         groups.setdefault(matched, []).append(record)
+        match_log.setdefault(matched, set()).add(ocr_name)
+
+    # 输出模糊映射日志
+    print("\n===== 名字匹配结果 =====")
+    for canonical, ocr_names in match_log.items():
+        for name in sorted(ocr_names):
+            if name != canonical:
+                print(f"  {name} -> {canonical}")
+            else:
+                print(f"  {name} (完全匹配)")
+        if canonical not in roster:
+            print(f"  [!] \"{canonical}\" 未在名字库中，请检查")
+    print("========================\n")
 
     results: List[Dict[str, Any]] = []
     for name, records in groups.items():
@@ -134,8 +149,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="合并多场 CS 战绩数据")
     parser.add_argument("--input-dir", type=str, default="output",
                         help="输入 JSON 目录（默认 output/）")
-    parser.add_argument("--output", type=str, default="merged.json",
-                        help="合并后输出路径（默认 merged.json）")
+    parser.add_argument("--output", type=str, default="result/merged.json",
+                        help="合并后输出路径（默认 result/merged.json）")
     parser.add_argument("--roster", type=str, default="players.json",
                         help="选手名字库路径（默认 players.json）")
     args = parser.parse_args()
