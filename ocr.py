@@ -443,14 +443,21 @@ def extract_match_stats(
 def main() -> None:
     parser = argparse.ArgumentParser(description="OCR CS 战绩截图并输出 test.json 格式")
     parser.add_argument("--image", type=str, default="img/test.png", help="输入图片路径")
-    parser.add_argument("--output", type=str, default="test.json", help="输出 JSON 路径")
-    parser.add_argument("--debug", type=str, default="debug_tokens.json",
+    parser.add_argument("--output", type=str, default="output/test.json", help="输出 JSON 路径")
+    parser.add_argument("--debug", type=str, default="",
                         help="调试用：将所有 OCR token 写入此文件（设为空字符串可关闭）")
+    parser.add_argument("--turns", type=int, required=True,
+                        help="输入局数（必填）")
     args = parser.parse_args()
 
     debug_path = args.debug if args.debug else None
     players = extract_match_stats(args.image, debug_path=debug_path)
 
+    for p in players:
+        p["turns"] = args.turns
+
+    import os
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(players, f, ensure_ascii=False, indent=2)
 
