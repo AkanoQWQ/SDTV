@@ -441,27 +441,35 @@ def extract_match_stats(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OCR CS 战绩截图并输出 test.json 格式")
-    parser.add_argument("--image", type=str, default="img/test.png", help="输入图片路径")
-    parser.add_argument("--output", type=str, default="output/test.json", help="输出 JSON 路径")
-    parser.add_argument("--debug", type=str, default="",
-                        help="调试用：将所有 OCR token 写入此文件（设为空字符串可关闭）")
+    import os
+
+    parser = argparse.ArgumentParser(description="OCR CS 战绩截图并输出 JSON")
+    parser.add_argument("--name", type=str, default="test",
+                        help="名称，自动映射 img/NAME.png -> output/NAME.json（默认 test）")
     parser.add_argument("--turns", type=int, required=True,
                         help="输入局数（必填）")
+    parser.add_argument("--debug", type=str, default="",
+                        help="调试用：将所有 OCR token 写入此文件（设为空字符串可关闭）")
     args = parser.parse_args()
 
+    image_path = os.path.join("img", f"{args.name}.png")
+    output_path = os.path.join("output", f"{args.name}.json")
+
+    if not os.path.exists(image_path):
+        print(f"[ERROR] 图片不存在: {image_path}")
+        return
+
     debug_path = args.debug if args.debug else None
-    players = extract_match_stats(args.image, debug_path=debug_path)
+    players = extract_match_stats(image_path, debug_path=debug_path)
 
     for p in players:
         p["turns"] = args.turns
 
-    import os
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
+    os.makedirs("output", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(players, f, ensure_ascii=False, indent=2)
 
-    print(f"已输出 {len(players)} 条数据到 {args.output}")
+    print(f"已输出 {len(players)} 条数据到 {output_path}")
 
 
 if __name__ == "__main__":
