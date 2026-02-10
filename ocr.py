@@ -5,7 +5,28 @@ from dataclasses import dataclass, asdict
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+from PIL import Image
 from paddleocr import PaddleOCR
+
+
+# ---------------------------------------------------------------------------
+# 图片预处理
+# ---------------------------------------------------------------------------
+
+def _preprocess_image(image_path: str, padding: int = 50) -> np.ndarray:
+    """
+    给图片四周加边框（复制边缘像素），防止靠近边缘的文字被 OCR 截断或漏检。
+    CS 战绩截图的玩家名字紧贴左边缘，OCR 检测器容易丢失。
+    """
+    img = Image.open(image_path).convert("RGB")
+    img_array = np.array(img)
+    padded = np.pad(
+        img_array,
+        ((padding, padding), (padding, padding), (0, 0)),
+        mode="edge",
+    )
+    return padded
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +94,6 @@ def _to_float(text: str) -> Optional[float]:
     except ValueError:
         return None
 
-
-def _to_int(text: str) -> Optional[int]:
-    t = _clean_numeric(text)
-    m = re.search(r"[-+]?\d+", t)
-    if not m:
-        return None
-    try:
-        return int(m.group(0))
-    except ValueError:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -322,76 +333,6 @@ def _pick_kda_index(row_tokens: List[OCRToken]) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# 列位置推断 & 基于 x 坐标的列分配
-# ---------------------------------------------------------------------------
-
-def _find_column_positions(
-    tokens: List[OCRToken],
-    row_centers: List[float],
-    row_tol: float,
-) -> Optional[List[float]]:
-    """从数据列最完整的一行推断 KDA 右侧 8 列（爆头率~残局）的 x 中心坐标"""
-    best_right: Optional[List[OCRToken]] = None
-    best_count = 0
-
-    for y in row_centers:
-        row_tokens = [t for t in tokens if abs(t.y - y) <= row_tol]
-        row_tokens.sort(key=lambda t: t.x)
-        kda_idx = _pick_kda_index(row_tokens)
-        if kda_idx is None:
-            continue
-        right = row_tokens[kda_idx + 1:]
-        if len(right) > best_count:
-            best_count = len(right)
-            best_right = right
-
-    if best_right is None or best_count < 8:
-        return None
-
-    return [t.x for t in best_right[:8]]
-
-
-def _assign_to_columns(
-    right_tokens: List[OCRToken],
-    col_positions: List[float],
-    col_tol: float = 60.0,
-) -> List[str]:
-    """
-    将 KDA 右侧的 token 按 x 坐标匹配到 8 个固定列。
-    若某列没有对应 token，则填 "0"。
-    使用贪心分配：按距离从近到远逐对匹配，保证一一映射。
-    """
-    n_cols = len(col_positions)
-    assigned = ["0"] * n_cols
-
-    # 构建 (token_idx, col_idx, distance) 候选
-    mappings: List[Tuple[int, int, float]] = []
-    for ti, tok in enumerate(right_tokens):
-        best_ci: Optional[int] = None
-        best_dist = float("inf")
-        for ci, cx in enumerate(col_positions):
-            dist = abs(tok.x - cx)
-            if dist < best_dist:
-                best_dist = dist
-                best_ci = ci
-        if best_ci is not None and best_dist <= col_tol:
-            mappings.append((ti, best_ci, best_dist))
-
-    # 贪心：距离最近的先匹配
-    mappings.sort(key=lambda m: m[2])
-    used_tokens: set = set()
-    used_cols: set = set()
-    for ti, ci, _ in mappings:
-        if ti in used_tokens or ci in used_cols:
-            continue
-        assigned[ci] = right_tokens[ti].text
-        used_tokens.add(ti)
-        used_cols.add(ci)
-
-    return assigned
-
-
-# ---------------------------------------------------------------------------
 # 构建单个玩家
 # ---------------------------------------------------------------------------
 
@@ -400,15 +341,8 @@ def _safe_float(text: str, default: float = 0.0) -> float:
     return float(v) if v is not None else default
 
 
-def _safe_int(text: str, default: int = 0) -> int:
-    v = _to_int(text)
-    return int(v) if v is not None else default
 
-
-def _build_player(
-    row_tokens: List[OCRToken],
-    col_positions: Optional[List[float]] = None,
-) -> Optional[Dict[str, Any]]:
+def _build_player(row_tokens: List[OCRToken]) -> Optional[Dict[str, Any]]:
     if not row_tokens:
         return None
 
@@ -429,15 +363,10 @@ def _build_player(
     if not player_name:
         player_name = "unknown"
 
-    # 右侧 8 列：爆头率 ADR RWS Rating+ 首杀 首死 多杀 残局
-    if col_positions is not None and len(col_positions) == 8:
-        vals = _assign_to_columns(right_tokens, col_positions)
-    else:
-        # 降级：按顺序取
-        vals = [t.text for t in right_tokens]
-        while len(vals) < 8:
-            vals.append("0")
-        vals = vals[:8]
+    # 右侧 4 列：爆头率 ADR RWS Rating+
+    vals = [t.text for t in right_tokens]
+    while len(vals) < 4:
+        vals.append("0")
 
     return {
         "player_name": player_name,
@@ -446,10 +375,6 @@ def _build_player(
         "adr": _safe_float(vals[1], 0.0),
         "rws": _safe_float(vals[2], 0.0),
         "rating_plus": _parse_rating_plus(vals[3]),
-        "first_kills": _safe_int(vals[4], 0),
-        "first_deaths": _safe_int(vals[5], 0),
-        "multi_kills": _safe_int(vals[6], 0),
-        "clutches": _safe_int(vals[7], 0),
     }
 
 
@@ -462,7 +387,8 @@ def extract_match_stats(
     debug_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     ocr = PaddleOCR(use_textline_orientation=True, lang="en")
-    raw = ocr.predict(image_path)
+    padded = _preprocess_image(image_path, padding=50)
+    raw = ocr.predict(padded)
 
     tokens = _extract_tokens_from_predict(raw)
 
@@ -488,18 +414,11 @@ def extract_match_stats(
         gaps = [row_centers[i + 1] - row_centers[i] for i in range(len(row_centers) - 1)]
         row_tol = max(10.0, min(30.0, median(gaps) * 0.42))
 
-    # 从最完整行推断列 x 坐标
-    col_positions = _find_column_positions(tokens, row_centers, row_tol)
-    if col_positions is not None:
-        print(f"[INFO] 列坐标参考: {[round(x, 1) for x in col_positions]}")
-    else:
-        print("[WARN] 未能推断列坐标，将按顺序分配（可能不准确）")
-
     players: List[Dict[str, Any]] = []
     for y in row_centers:
         row_tokens = [t for t in tokens if abs(t.y - y) <= row_tol]
         row_tokens.sort(key=lambda t: t.x)
-        player = _build_player(row_tokens, col_positions)
+        player = _build_player(row_tokens)
         if player is not None:
             players.append(player)
 
