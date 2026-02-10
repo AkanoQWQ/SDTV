@@ -386,7 +386,7 @@ def extract_match_stats(
     image_path: str,
     debug_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    ocr = PaddleOCR(use_textline_orientation=True, lang="en")
+    ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
     padded = _preprocess_image(image_path, padding=50)
     raw = ocr.predict(padded)
 
