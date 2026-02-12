@@ -14,19 +14,22 @@ from paddleocr import PaddleOCR
 # 图片预处理
 # ---------------------------------------------------------------------------
 
-def _preprocess_image(image_path: str, padding: int = 50) -> np.ndarray:
+def _preprocess_image(image_path: str, padding: int = 50, scale: float = 2.0) -> np.ndarray:
     """
-    给图片四周加边框（复制边缘像素），防止靠近边缘的文字被 OCR 截断或漏检。
-    CS 战绩截图的玩家名字紧贴左边缘，OCR 检测器容易丢失。
+    图片预处理：放大 + 加边框，提高 OCR 对小文字和边缘文字的识别率。
     """
     img = Image.open(image_path).convert("RGB")
+    if scale != 1.0:
+        w, h = img.size
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     img_array = np.array(img)
-    padded = np.pad(
-        img_array,
-        ((padding, padding), (padding, padding), (0, 0)),
-        mode="edge",
-    )
-    return padded
+    if padding > 0:
+        img_array = np.pad(
+            img_array,
+            ((padding, padding), (padding, padding), (0, 0)),
+            mode="edge",
+        )
+    return img_array
 
 
 # ---------------------------------------------------------------------------
@@ -160,12 +163,23 @@ def _is_name_token(text: str) -> bool:
     t = text.strip()
     if not t:
         return False
-    if re.search(r"[A-Za-z]", t):
+    # CJK 字符 → 一定是名字
+    if re.search(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]", t):
         return True
+    # 含拉丁字母 → 可能是名字，但排除图标 OCR 噪声
+    if re.search(r"[A-Za-z]", t):
+        # 单字符如 "O","V" → 噪声
+        if len(t) <= 1:
+            return False
+        # 含引号/撇号的短 token（如 "OL'L"）→ 噪声
+        if re.search(r"['\"`]", t) and len(t) <= 5:
+            return False
+        return True
+    # 纯数值
     if _is_numeric_like(t):
         return False
-    # 符号型 token（. * - 等）允许作为名字的一部分
-    return True
+    # 其余（纯符号/数字+标点 如 "89'0"、"88'0"）→ 不是名字，多为图标 OCR 噪声
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -354,17 +368,37 @@ def _build_player(row_tokens: List[OCRToken]) -> Optional[Dict[str, Any]]:
     if kda is None:
         return None
 
+    kda_x = row_tokens[kda_idx].x
     left_tokens = row_tokens[:kda_idx]
     right_tokens = row_tokens[kda_idx + 1:]
 
-    # 名字：保留原始文本（不做数值清洗）
-    name_parts = [t.text for t in left_tokens if _is_name_token(t.text)]
+    # ---------- 检测布局方向 ----------
+    # 正常：名字在左(low x)，数据在右(high x)
+    # 翻转：名字在右(high x)，数据在左(low x)
+    left_names = sum(1 for t in left_tokens if _is_name_token(t.text))
+    right_names = sum(1 for t in right_tokens if _is_name_token(t.text))
+    left_nums = sum(1 for t in left_tokens if _is_numeric_like(t.text))
+    right_nums = sum(1 for t in right_tokens if _is_numeric_like(t.text))
+
+    if right_names > left_names and left_nums > right_nums:
+        # 翻转布局：名字在 KDA 右侧，数据在 KDA 左侧
+        name_side = right_tokens
+        data_side = left_tokens
+    else:
+        # 正常布局
+        name_side = left_tokens
+        data_side = right_tokens
+
+    # ---------- 名字 ----------
+    name_parts = [t.text for t in name_side if _is_name_token(t.text)]
     player_name = " ".join(name_parts).strip()
     if not player_name:
         player_name = "unknown"
 
-    # 右侧 4 列：爆头率 ADR RWS Rating+
-    vals = [t.text for t in right_tokens]
+    # ---------- 数据列：按距离 KDA 由近到远 = headshot → ADR → RWS → Rating+ ----------
+    data_numeric = [t for t in data_side if _is_numeric_like(t.text)]
+    data_numeric.sort(key=lambda t: abs(t.x - kda_x))
+    vals = [t.text for t in data_numeric]
     while len(vals) < 4:
         vals.append("0")
 
@@ -386,7 +420,12 @@ def extract_match_stats(
     image_path: str,
     debug_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
+    ocr = PaddleOCR(
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        lang="ch",
+    )
     padded = _preprocess_image(image_path, padding=50)
     raw = ocr.predict(padded)
 
@@ -416,7 +455,7 @@ def extract_match_stats(
 
     players: List[Dict[str, Any]] = []
     for y in row_centers:
-        row_tokens = [t for t in tokens if abs(t.y - y) <= row_tol]
+        row_tokens = [t for t in tokens if abs(t.y - y) <= row_tol and t.conf >= 0.5]
         row_tokens.sort(key=lambda t: t.x)
         player = _build_player(row_tokens)
         if player is not None:
@@ -448,8 +487,8 @@ def main() -> None:
                         help="名称，自动映射 img/NAME.png -> output/NAME.json（默认 test）")
     parser.add_argument("--turns", type=int, required=True,
                         help="输入局数（必填）")
-    parser.add_argument("--debug", type=str, default="",
-                        help="调试用：将所有 OCR token 写入此文件（设为空字符串可关闭）")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="关闭 debug token 输出")
     args = parser.parse_args()
 
     image_path = os.path.join("img", f"{args.name}.png")
@@ -459,7 +498,7 @@ def main() -> None:
         print(f"[ERROR] 图片不存在: {image_path}")
         return
 
-    debug_path = args.debug if args.debug else None
+    debug_path = None if args.no_debug else "debug_tokens.json"
     players = extract_match_stats(image_path, debug_path=debug_path)
 
     for p in players:
